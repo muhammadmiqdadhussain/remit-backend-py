@@ -1,12 +1,86 @@
 import os
 import re
 import asyncio
+import random
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Remittance Rates API")
+
+# Scraper hardening to reduce provider blocking risk.
+HTTP_TIMEOUT_SECONDS = 6.0
+MAX_RETRIES = 3
+RETRY_BASE_DELAY_SECONDS = 0.6
+MAX_OUTBOUND_CONCURRENCY = 2
+PROVIDER_BACKOFF_SECONDS = 300
+ENABLE_ACE_PROVIDER = os.getenv("ENABLE_ACE_PROVIDER", "true").strip().lower() in ("1", "true", "yes", "on")
+
+REQUEST_SEMAPHORE = asyncio.Semaphore(MAX_OUTBOUND_CONCURRENCY)
+PROVIDER_BACKOFF_UNTIL: Dict[str, float] = {}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+
+
+def is_provider_in_backoff(provider: str) -> bool:
+    return time.time() < PROVIDER_BACKOFF_UNTIL.get(provider, 0.0)
+
+
+def mark_provider_backoff(provider: str, seconds: int = PROVIDER_BACKOFF_SECONDS) -> None:
+    PROVIDER_BACKOFF_UNTIL[provider] = time.time() + float(seconds)
+
+
+async def request_with_retry(
+    client: httpx.AsyncClient,
+    provider: str,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> Optional[httpx.Response]:
+    if is_provider_in_backoff(provider):
+        return None
+
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers.setdefault("User-Agent", random.choice(USER_AGENTS))
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT_SECONDS)
+
+    for attempt in range(MAX_RETRIES):
+        await asyncio.sleep(random.uniform(0.05, 0.25))
+        try:
+            async with REQUEST_SEMAPHORE:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    **kwargs,
+                )
+
+            if response.status_code < 400:
+                return response
+
+            if response.status_code in (403, 429):
+                mark_provider_backoff(provider)
+                print(f"[{provider}] blocked with status {response.status_code}, backing off for {PROVIDER_BACKOFF_SECONDS}s")
+                return None
+
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0.0, 0.4))
+                continue
+            return None
+        except httpx.RequestError as e:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0.0, 0.4))
+                continue
+            print(f"[{provider}] Network Error: {e}")
+            return None
+
+    return None
 
 # Allow your TypeScript frontend to call this API without CORS errors
 app.add_middleware(
@@ -27,9 +101,12 @@ async def fetch_taptap_send(from_country: str, to_country: str, amount: float) -
         'X-Device-Model': 'web',
     }
     
+    provider = "Taptap Send"
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, headers=headers, timeout=4.0)
+            response = await request_with_retry(client, provider, "GET", url, headers=headers)
+            if response is None:
+                return None
             data = response.json()
             
             for country in data.get('availableCountries', []):
@@ -50,7 +127,7 @@ async def fetch_taptap_send(from_country: str, to_country: str, amount: float) -
                                 "received_amount": round((amount * rate) - fee, 2)
                             }
         except Exception as e:
-            print(f"[Taptap Send] Error: {e}")
+            print(f"[{provider}] Error: {e}")
     return None
 
 
@@ -92,9 +169,12 @@ async def fetch_remit_choice(from_country: str, to_country: str, amount: float) 
         'Referer': 'https://www.remitchoice.com/',
     }
     
+    provider = "RemitChoice"
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url, data=payload, headers=headers, timeout=4.0)
+            response = await request_with_retry(client, provider, "POST", url, data=payload, headers=headers)
+            if response is None:
+                return None
             html = response.text
             
             rate_match = re.search(r'Exchange Rate 1 [A-Z]{3} = (\d+(?:\.\d+)?) [A-Z]{3}', html)
@@ -110,7 +190,7 @@ async def fetch_remit_choice(from_country: str, to_country: str, amount: float) 
                     "received_amount": round((amount * exchange_rate) - transfer_fee, 2)
                 }
         except Exception as e:
-            print(f"[RemitChoice] Error: {e}")
+            print(f"[{provider}] Error: {e}")
             
     return None
 
@@ -153,9 +233,12 @@ async def fetch_remitly(from_country: str, to_country: str, amount: float) -> Op
         'Accept-Language': 'en-US,en;q=0.9',
     }
     
+    provider = "Remitly"
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            response = await client.get(url, headers=headers, timeout=4.0)
+            response = await request_with_retry(client, provider, "GET", url, headers=headers)
+            if response is None:
+                return None
             html = response.text
             
             # Use smart regex to extract from HTML text rendered by server
@@ -177,7 +260,7 @@ async def fetch_remitly(from_country: str, to_country: str, amount: float) -> Op
             }
                 
         except Exception as e:
-            print(f"[Remitly] Network Error: {e}")
+            print(f"[{provider}] Network Error: {e}")
             
     return None
 
@@ -240,10 +323,19 @@ async def fetch_ace_money(from_country: str, to_country: str, amount: float) -> 
         
     encoded_data = urllib.parse.urlencode(payload)
     
+    provider = "ACE Money"
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
             # 1. First get cookies and XSRF
-            home_res = await client.get("https://acemoneytransfer.com/", headers={'User-Agent': headers['User-Agent']}, timeout=4.0)
+            home_res = await request_with_retry(
+                client,
+                provider,
+                "GET",
+                "https://acemoneytransfer.com/",
+                headers={'User-Agent': headers['User-Agent']},
+            )
+            if home_res is None:
+                return None
             
             # The Laravel CSRF token is in the cookies as XSRF-TOKEN
             xsrf = client.cookies.get('XSRF-TOKEN')
@@ -251,7 +343,9 @@ async def fetch_ace_money(from_country: str, to_country: str, amount: float) -> 
                 headers['X-XSRF-TOKEN'] = urllib.parse.unquote(xsrf)
                 
             # 2. Make the POST request
-            res = await client.post(url, headers=headers, content=encoded_data, timeout=4.0)
+            res = await request_with_retry(client, provider, "POST", url, headers=headers, content=encoded_data)
+            if res is None:
+                return None
             
             data = res.json()
             if data and isinstance(data, dict):
@@ -283,7 +377,7 @@ async def fetch_ace_money(from_country: str, to_country: str, amount: float) -> 
                 print(f"[ACE Money] Debug structure: {str(data)[:250]}")
                 
         except Exception as e:
-            print(f"[ACE Money] Network Error: {e}")
+            print(f"[{provider}] Network Error: {e}")
             
     return None
 
@@ -312,13 +406,21 @@ async def get_rates(
         fetch_taptap_send(from_country, to_country, amount),
         fetch_remit_choice(from_country, to_country, amount),
         fetch_remitly(from_country, to_country, amount),
-        fetch_ace_money(from_country, to_country, amount)
     ]
+
+    if ENABLE_ACE_PROVIDER:
+        tasks.append(fetch_ace_money(from_country, to_country, amount))
     
     results = await asyncio.gather(*tasks)
     
     # Filter out None results
     valid_rates = [res for res in results if res is not None]
+
+    # Gracefully degrade to stale cache if every provider fails temporarily.
+    if not valid_rates and cache_key in RATE_CACHE:
+        cached_time, cached_results = RATE_CACHE[cache_key]
+        if current_time - cached_time < 3600 and cached_results:
+            return cached_results
     
     # Sort by who gives the recipient the most money (descending)
     valid_rates.sort(key=lambda x: x['received_amount'], reverse=True)

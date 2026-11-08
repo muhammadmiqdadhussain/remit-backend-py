@@ -1,0 +1,5 @@
+fastapi>=0.135
+uvicorn[standard]>=0.42
+httpx>=0.28
+# Optional: enables AES-GCM encryption of stored rate alerts (ALERTS_KEY)
+cryptography>=42

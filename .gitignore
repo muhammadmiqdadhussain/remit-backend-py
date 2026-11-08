@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime output
+*.log
+nohup.out
+
+# Local environment
+.env

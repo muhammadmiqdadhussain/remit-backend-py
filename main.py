@@ -3,19 +3,154 @@ import re
 import asyncio
 import random
 import httpx
-from fastapi import FastAPI, Query
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, EmailStr
+import smtplib
+from email.message import EmailMessage
+import base64
+from binascii import unhexlify
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTO_AVAILABLE = True
+except Exception:
+    AESGCM = None  # type: ignore
+    CRYPTO_AVAILABLE = False
 
 app = FastAPI(title="Remittance Rates API")
 
-# Scraper hardening to reduce provider blocking risk.
+# ============ RATE ALERTS CONFIGURATION ============
+ALERTS_FILE = Path("/tmp/rate_alerts.json")
+ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# Optional symmetric key for encrypting alerts at rest. Provide 64-hex chars (32 bytes) in ALERTS_KEY.
+ALERTS_KEY_HEX = os.getenv("ALERTS_KEY")
+ALERTS_KEY: bytes | None = None
+if ALERTS_KEY_HEX:
+    try:
+        ALERTS_KEY = unhexlify(ALERTS_KEY_HEX.strip())
+        if len(ALERTS_KEY) != 32:
+            print("ALERTS_KEY must be 32 bytes (64 hex chars); encryption disabled")
+            ALERTS_KEY = None
+        elif not CRYPTO_AVAILABLE:
+            print("cryptography not installed; ALERTS_KEY provided but crypto unavailable")
+            ALERTS_KEY = None
+    except Exception as e:
+        print(f"Failed to parse ALERTS_KEY: {e}")
+        ALERTS_KEY = None
+
+class RateAlertRequest(BaseModel):
+    email: str  # Will validate format on frontend
+    fromCurrency: str
+    toCurrency: str
+    targetRate: Optional[float] = None
+    timestamp: str
+
+def load_alerts() -> Dict[str, List[Dict]]:
+    """Load rate alerts from file."""
+    if not ALERTS_FILE.exists():
+        return {}
+
+    try:
+        with open(ALERTS_FILE, 'r') as f:
+            raw = json.load(f)
+
+        # If file contains encrypted payload, decrypt it
+        if isinstance(raw, dict) and raw.get("_encrypted") and ALERTS_KEY:
+            enc_b64 = raw.get("_encrypted")
+            try:
+                payload = base64.b64decode(enc_b64)
+                # nonce (12) + ciphertext
+                nonce = payload[:12]
+                ct = payload[12:]
+                aesgcm = AESGCM(ALERTS_KEY)
+                decrypted = aesgcm.decrypt(nonce, ct, None)
+                return json.loads(decrypted.decode('utf-8'))
+            except Exception as e:
+                print(f"Failed to decrypt alerts file: {e}")
+                return {}
+
+        # fallback: assume plaintext JSON alerts structure
+        if isinstance(raw, dict):
+            return raw
+        return {}
+    except Exception:
+        return {}
+
+def save_alerts(alerts: Dict[str, List[Dict]]) -> None:
+    """Save rate alerts to file."""
+    try:
+        # If ALERTS_KEY is set, encrypt the serialized alerts and store under _encrypted
+        if ALERTS_KEY:
+            try:
+                aesgcm = AESGCM(ALERTS_KEY)
+                nonce = os.urandom(12)
+                plaintext = json.dumps(alerts, separators=(',', ':')).encode('utf-8')
+                ct = aesgcm.encrypt(nonce, plaintext, None)
+                payload = nonce + ct
+                enc_b64 = base64.b64encode(payload).decode('utf-8')
+                with open(ALERTS_FILE, 'w') as f:
+                    json.dump({'_encrypted': enc_b64}, f)
+                return
+            except Exception as e:
+                print(f"Encryption failed, falling back to plaintext save: {e}")
+
+        with open(ALERTS_FILE, 'w') as f:
+            json.dump(alerts, f, indent=2)
+    except Exception as e:
+        print(f"Error saving alerts: {e}")
+
+
+# ============ EMAIL (OPTIONAL) CONFIGURATION ============
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "no-reply@remitmatrix.com")
+
+def send_confirmation_email(to_email: str, corridor: str) -> None:
+    """Send a minimal confirmation email. Avoid including sensitive details.
+    This function is optional: if SMTP_* env vars are not set it will be a no-op.
+    """
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        # SMTP not configured in this environment; do nothing
+        print("SMTP not configured; skipping confirmation email")
+        return
+
+    subject = f"RemitMatrix: Alert created for {corridor}"
+    body = (
+        f"Your rate alert for {corridor} has been created.\n\n"
+        "We will notify you when conditions are met.\n\n"
+        "Note: for your privacy we avoid including full alert details in email messages."
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+            print(f"Sent confirmation email to {to_email} for {corridor}")
+    except Exception as e:
+        print(f"Failed to send confirmation email: {e}")
+
+# ============ CORS CONFIGURATION ============
 HTTP_TIMEOUT_SECONDS = 6.0
 MAX_RETRIES = 3
 RETRY_BASE_DELAY_SECONDS = 0.6
 MAX_OUTBOUND_CONCURRENCY = 2
 PROVIDER_BACKOFF_SECONDS = 300
-ENABLE_ACE_PROVIDER = os.getenv("ENABLE_ACE_PROVIDER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 REQUEST_SEMAPHORE = asyncio.Semaphore(MAX_OUTBOUND_CONCURRENCY)
 PROVIDER_BACKOFF_UNTIL: Dict[str, float] = {}
@@ -264,123 +399,6 @@ async def fetch_remitly(from_country: str, to_country: str, amount: float) -> Op
             
     return None
 
-import urllib.parse
-async def fetch_ace_money(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
-    """Scrapes ACE Money Transfer using their make-request proxy endpoint."""
-    
-    numeric_codes = {
-        'AT': '040', 'US': '840', 'GB': '826', 'PK': '586', 
-        'IN': '356', 'BD': '050', 'PH': '608', 'DE': '276', 
-        'FR': '250', 'ES': '724', 'IT': '380', 'NL': '528', 
-        'CN': '156', 'AE': '784', 'BE': '056'
-    }
-    currency_map = {
-        'AT': 'EUR', 'DE': 'EUR', 'FR': 'EUR', 'IT': 'EUR', 
-        'ES': 'EUR', 'NL': 'EUR', 'BE': 'EUR', 'US': 'USD', 
-        'GB': 'GBP', 'AE': 'AED'
-    }
-    
-    src_numeric = numeric_codes.get(from_country)
-    dest_numeric = numeric_codes.get(to_country)
-    user_currency = currency_map.get(from_country, 'EUR')
-    
-    if not src_numeric or not dest_numeric:
-        print(f"[ACE Money] Missing numeric mapping for {from_country} -> {to_country}")
-        return None
-        
-    url = "https://acemoneytransfer.com/make-request"
-    
-    headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Origin': 'https://acemoneytransfer.com',
-        'Referer': 'https://acemoneytransfer.com/',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest'
-    }
-    
-    payload = {
-        'uri': 'rate/calculator',
-        'type': 'POST',
-        'data[src_amount]': str(amount),
-        'data[dest_amount]': '',
-        'data[g-recaptcha-response]': '',
-        'data[calculate]': '1',
-        'data[user_currency]': user_currency,
-        'data[calculation_mode]': 'S',
-        'data[dest_iso_numeric_code]': dest_numeric,
-        'data[src_iso_numeric_code]': src_numeric,
-        'auth': 'true'
-    }
-    
-    # ACE often requires specific payer IDs for specific corridors. 
-    # If we know them, we can append them. '40' represents an Indian receiving method maybe?
-    if to_country == 'IN':
-        payload['data[sepecific_payer_id]'] = '40'
-    elif to_country == 'PK':
-        # Let's try appending nothing, or a known PK id if we had one.
-        pass
-        
-    encoded_data = urllib.parse.urlencode(payload)
-    
-    provider = "ACE Money"
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            # 1. First get cookies and XSRF
-            home_res = await request_with_retry(
-                client,
-                provider,
-                "GET",
-                "https://acemoneytransfer.com/",
-                headers={'User-Agent': headers['User-Agent']},
-            )
-            if home_res is None:
-                return None
-            
-            # The Laravel CSRF token is in the cookies as XSRF-TOKEN
-            xsrf = client.cookies.get('XSRF-TOKEN')
-            if xsrf:
-                headers['X-XSRF-TOKEN'] = urllib.parse.unquote(xsrf)
-                
-            # 2. Make the POST request
-            res = await request_with_retry(client, provider, "POST", url, headers=headers, content=encoded_data)
-            if res is None:
-                return None
-            
-            data = res.json()
-            if data and isinstance(data, dict):
-                # The response here usually drops a JSON with embedded calculation results or HTML
-                # Let's inspect standard ACE response structures
-                
-                # Typical ace success payload has 'data' child that contains arrays or another dict.
-                if 'data' in data:
-                    inner_data = data['data']
-                    if isinstance(inner_data, dict):
-                        # They pass back rate and fee
-                        rate = float(inner_data.get('exchange_rate', 0.0))
-                        fee = float(inner_data.get('fee', 0.0))
-                        
-                        # Sometimes they return 'source_amount' and 'destination_amount'
-                        if rate == 0 and 'destination_amount' in inner_data:
-                            dest_amt = float(inner_data['destination_amount'])
-                            rate = round(dest_amt / amount, 4)
-                            
-                        if rate > 0:
-                            return {
-                                "provider": "ACE Money Transfer",
-                                "rate": rate,
-                                "fee": fee,
-                                "received_amount": round((amount * rate) - fee, 2)
-                            }
-                
-                # Fallback: Print what their structure actually is if standard fails
-                print(f"[ACE Money] Debug structure: {str(data)[:250]}")
-                
-        except Exception as e:
-            print(f"[{provider}] Network Error: {e}")
-            
-    return None
-
 @app.get("/api/rates")
 @app.get("/rates")
 async def get_rates(
@@ -407,9 +425,6 @@ async def get_rates(
         fetch_remit_choice(from_country, to_country, amount),
         fetch_remitly(from_country, to_country, amount),
     ]
-
-    if ENABLE_ACE_PROVIDER:
-        tasks.append(fetch_ace_money(from_country, to_country, amount))
     
     results = await asyncio.gather(*tasks)
     
@@ -427,5 +442,148 @@ async def get_rates(
     
     # Save the successful result to our cache
     RATE_CACHE[cache_key] = (current_time, valid_rates)
+    
+    return valid_rates
+
+
+# ============ RATE ALERTS ENDPOINTS ============
+
+@app.post("/api/rate-alerts")
+async def create_rate_alert(request: RateAlertRequest):
+    """
+    Create a new rate alert for a specific currency pair.
+    Prevents duplicate alerts for the same email + corridor.
+    """
+    # Validate email format
+    if not request.email or "@" not in request.email:
+        raise HTTPException(
+            status_code=400, 
+            detail={"message": "Please enter a valid email address"}
+        )
+    
+    # Validate currency codes
+    if not request.fromCurrency or len(request.fromCurrency) != 2:
+        raise HTTPException(
+            status_code=400, 
+            detail={"message": "Invalid source currency code"}
+        )
+    
+    if not request.toCurrency or len(request.toCurrency) != 2:
+        raise HTTPException(
+            status_code=400, 
+            detail={"message": "Invalid destination currency code"}
+        )
+    
+    # Prevent self-transfer
+    if request.fromCurrency.upper() == request.toCurrency.upper():
+        raise HTTPException(
+            status_code=400, 
+            detail={"message": "Source and destination currencies must be different"}
+        )
+    
+    # Load existing alerts
+    alerts = load_alerts()
+    
+    # Create corridor key
+    corridor_key = f"{request.fromCurrency.upper()}-{request.toCurrency.upper()}"
+    
+    # Check for existing alert from this email for this corridor
+    if corridor_key not in alerts:
+        alerts[corridor_key] = []
+    
+    # Check if user already has an alert for this corridor
+    existing_alert = any(
+        alert["email"].lower() == request.email.lower() 
+        for alert in alerts[corridor_key]
+    )
+    
+    if existing_alert:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "You already have an alert for this corridor. Check your inbox for updates."
+            }
+        )
+    
+    # Add new alert
+    alert_entry = {
+        "email": request.email,
+        "targetRate": request.targetRate,
+        "timestamp": request.timestamp,
+        "active": True,
+    }
+    
+    alerts[corridor_key].append(alert_entry)
+    save_alerts(alerts)
+    # Try to send a minimal confirmation email (optional)
+    try:
+        send_confirmation_email(request.email, corridor_key)
+    except Exception:
+        # swallow email failures so API remains functional
+        pass
+
+    return {
+        "success": True,
+        "message": f"Rate alert created for {corridor_key}",
+        "corridor": corridor_key,
+        "email": request.email
+    }
+
+
+@app.get("/api/rate-alerts/status")
+async def get_alert_status(email: str = Query(...)):
+    """Get the status of rate alerts for a specific email."""
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    
+    alerts = load_alerts()
+    user_alerts = {}
+    
+    for corridor, corridor_alerts in alerts.items():
+        user_corridor_alerts = [
+            alert for alert in corridor_alerts 
+            if alert["email"].lower() == email.lower()
+        ]
+        if user_corridor_alerts:
+            user_alerts[corridor] = user_corridor_alerts
+    
+    return {
+        "email": email,
+        "alerts": user_alerts,
+        "count": sum(len(v) for v in user_alerts.values())
+    }
+
+
+@app.delete("/api/rate-alerts/{corridor}")
+async def delete_rate_alert(corridor: str, email: str = Query(...)):
+    """Delete a rate alert."""
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    
+    alerts = load_alerts()
+    
+    if corridor not in alerts:
+        raise HTTPException(status_code=404, detail="Corridor not found")
+    
+    # Remove alert for this user
+    initial_count = len(alerts[corridor])
+    alerts[corridor] = [
+        alert for alert in alerts[corridor]
+        if alert["email"].lower() != email.lower()
+    ]
+    
+    if len(alerts[corridor]) == initial_count:
+        raise HTTPException(
+            status_code=404, 
+            detail="Alert not found for this user"
+        )
+    
+    # Remove corridor if no alerts left
+    if not alerts[corridor]:
+        del alerts[corridor]
+    
+    save_alerts(alerts)
+    
+    return {"success": True, "message": f"Alert deleted for {corridor}"}
     
     return valid_rates

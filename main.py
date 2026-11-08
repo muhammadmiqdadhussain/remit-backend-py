@@ -6,12 +6,10 @@ import httpx
 import json
 import time
 from pathlib import Path
-from datetime import datetime
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 import smtplib
 from email.message import EmailMessage
 import base64
@@ -145,7 +143,7 @@ def send_confirmation_email(to_email: str, corridor: str) -> None:
     except Exception as e:
         print(f"Failed to send confirmation email: {e}")
 
-# ============ CORS CONFIGURATION ============
+# ============ OUTBOUND REQUEST HARDENING ============
 HTTP_TIMEOUT_SECONDS = 6.0
 MAX_RETRIES = 3
 RETRY_BASE_DELAY_SECONDS = 0.6
@@ -328,9 +326,6 @@ async def fetch_remit_choice(from_country: str, to_country: str, amount: float) 
             print(f"[{provider}] Error: {e}")
             
     return None
-
-import json
-import time
 
 # Simple in-memory cache to prevent LiteSpeed max children errors
 RATE_CACHE = {}
@@ -585,5 +580,3 @@ async def delete_rate_alert(corridor: str, email: str = Query(...)):
     save_alerts(alerts)
     
     return {"success": True, "message": f"Alert deleted for {corridor}"}
-    
-    return valid_rates

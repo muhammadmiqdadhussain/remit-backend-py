@@ -1,16 +1,11 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy app first so requirements check works even when requirements.txt is absent.
-COPY . .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install dependencies from requirements.txt if present, otherwise install minimal runtime deps.
-RUN if [ -f "requirements.txt" ]; then \
-      pip install --no-cache-dir -r requirements.txt; \
-    else \
-      pip install --no-cache-dir fastapi uvicorn httpx; \
-    fi
+COPY . .
 
 EXPOSE 8005
 

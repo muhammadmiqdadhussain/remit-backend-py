@@ -14,9 +14,19 @@ port 8005, and nginx proxies `/api/` to it.
 
 ## Rates API
 
-- `GET /api/rates?from_country=GB&to_country=PK&amount=1000` returns quotes
-  from Taptap Send, RemitChoice and Remitly, sorted by recipient payout.
-  Results are cached for 10 minutes.
+- `GET /api/rates?from_country=GB&to_country=PK&amount=1000` returns quotes from
+  Taptap Send, RemitChoice, Remitly and Profee, sorted by recipient payout
+  (`(amount - fee) * rate`). Cached for 10 minutes. Each quote has `rate`,
+  `fee`, `received_amount` and, where the provider publishes one, a
+  first-transfer offer: `promotional_rate`, `promo_received_amount`,
+  `promo_max_amount`, `promo_description`. `payout_methods` is included only
+  when the provider's own data lists them (Remitly, RemitChoice).
+- `GET /api/mid-market?base=EUR&quote=PKR` returns a reference mid-market rate
+  from ExchangeRate-API's open feed (updated daily; fallback: currency-api),
+  cached for 1 hour.
+
+Not available from this server: ACE Money Transfer (Cloudflare block) and
+MoneyGram (DataDome bot protection on its quote API).
 
 ## Rate alert API
 

@@ -6,6 +6,7 @@ import httpx
 import json
 import time
 from pathlib import Path
+from datetime import datetime
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
@@ -205,6 +206,7 @@ async def request_with_retry(
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0.0, 0.4))
                 continue
+            print(f"[{provider}] HTTP {response.status_code} for {url}")
             return None
         except httpx.RequestError as e:
             if attempt < MAX_RETRIES - 1:
@@ -225,144 +227,147 @@ app.add_middleware(
 )
 
 
-async def fetch_taptap_send(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
-    """Native JSON API scraping for Taptap Send"""
-    url = "https://api.taptapsend.com/api/fxRates"
-    headers = {
-        'Appian-Version': 'web/2022-05-03.0',
-        'X-Device-Id': 'web',
-        'X-Device-Model': 'web',
+# ============ COUNTRY DATA ============
+# ISO2 -> (ISO3, ISO numeric, currency, Remitly URL slug)
+COUNTRIES: Dict[str, tuple] = {
+    'GB': ('GBR', 826, 'GBP', 'united-kingdom'),
+    'AT': ('AUT', 40, 'EUR', 'austria'),
+    'BE': ('BEL', 56, 'EUR', 'belgium'),
+    'BG': ('BGR', 100, 'EUR', 'bulgaria'),
+    'HR': ('HRV', 191, 'EUR', 'croatia'),
+    'CY': ('CYP', 196, 'EUR', 'cyprus'),
+    'EE': ('EST', 233, 'EUR', 'estonia'),
+    'FI': ('FIN', 246, 'EUR', 'finland'),
+    'FR': ('FRA', 250, 'EUR', 'france'),
+    'DE': ('DEU', 276, 'EUR', 'germany'),
+    'GR': ('GRC', 300, 'EUR', 'greece'),
+    'IE': ('IRL', 372, 'EUR', 'ireland'),
+    'IT': ('ITA', 380, 'EUR', 'italy'),
+    'LV': ('LVA', 428, 'EUR', 'latvia'),
+    'LT': ('LTU', 440, 'EUR', 'lithuania'),
+    'LU': ('LUX', 442, 'EUR', 'luxembourg'),
+    'MT': ('MLT', 470, 'EUR', 'malta'),
+    'NL': ('NLD', 528, 'EUR', 'netherlands'),
+    'PT': ('PRT', 620, 'EUR', 'portugal'),
+    'SK': ('SVK', 703, 'EUR', 'slovakia'),
+    'SI': ('SVN', 705, 'EUR', 'slovenia'),
+    'ES': ('ESP', 724, 'EUR', 'spain'),
+    'IN': ('IND', 356, 'INR', 'india'),
+    'PK': ('PAK', 586, 'PKR', 'pakistan'),
+    'BD': ('BGD', 50, 'BDT', 'bangladesh'),
+    'LK': ('LKA', 144, 'LKR', 'sri-lanka'),
+    'NP': ('NPL', 524, 'NPR', 'nepal'),
+    'NG': ('NGA', 566, 'NGN', 'nigeria'),
+    'PH': ('PHL', 608, 'PHP', 'philippines'),
+    'VN': ('VNM', 704, 'VND', 'vietnam'),
+    'TH': ('THA', 764, 'THB', 'thailand'),
+    'GH': ('GHA', 288, 'GHS', 'ghana'),
+    'KE': ('KEN', 404, 'KES', 'kenya'),
+    'MA': ('MAR', 504, 'MAD', 'morocco'),
+}
+
+
+def quote(provider: str, rate: float, fee: float, amount: float, **extra: Any) -> Dict[str, Any]:
+    """Standard quote shape returned to the frontend. Regular (non-promo) values
+    always drive ranking; promo fields describe a separate first-transfer offer."""
+    result: Dict[str, Any] = {
+        "provider": provider,
+        "rate": round(rate, 6),
+        "fee": round(fee, 2),
+        # Fees are charged in the sending currency, so they reduce the amount converted.
+        "received_amount": round((amount - fee) * rate, 2),
     }
-    
+    result.update({k: v for k, v in extra.items() if v is not None})
+    return result
+
+
+# ============ PROVIDERS ============
+TAPTAP_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
+
+
+async def fetch_taptap_send(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
+    """Taptap Send publishes one JSON feed with every corridor's rate and fee tiers."""
     provider = "Taptap Send"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await request_with_retry(client, provider, "GET", url, headers=headers)
+    try:
+        if TAPTAP_CACHE["data"] is None or time.time() - TAPTAP_CACHE["at"] > CACHE_DURATION_SECONDS:
+            async with httpx.AsyncClient() as client:
+                response = await request_with_retry(
+                    client, provider, "GET", "https://api.taptapsend.com/api/fxRates",
+                    headers={'Appian-Version': 'web/2022-05-03.0', 'X-Device-Id': 'web', 'X-Device-Model': 'web'},
+                )
             if response is None:
                 return None
-            data = response.json()
-            
-            for country in data.get('availableCountries', []):
-                if country['isoCountryCode'] == from_country:
-                    for corridor in country.get('corridors', []):
-                        if corridor['isoCountryCode'] == to_country:
-                            rate = float(corridor['fxRate'])
-                            fee = float(corridor.get('fee') or 0.0)
-                            
-                            # Custom rule: Taptap Send charges ~0.99 for small EUR transfers
-                            if from_country in ['DE', 'FR', 'IT', 'ES', 'NL', 'AT', 'BE'] and amount < 170:
-                                fee = 0.99
-                                
-                            return {
-                                "provider": "Taptap Send",
-                                "rate": rate,
-                                "fee": fee,
-                                "received_amount": round((amount * rate) - fee, 2)
-                            }
-        except Exception as e:
-            print(f"[{provider}] Error: {e}")
+            TAPTAP_CACHE.update(at=time.time(), data=response.json())
+
+        for country in TAPTAP_CACHE["data"].get('availableCountries', []):
+            if country.get('isoCountryCode') != from_country:
+                continue
+            for corridor in country.get('corridors', []):
+                if corridor.get('isoCountryCode') != to_country:
+                    continue
+                rate = float(corridor['fxRate'])
+                # Fee tiers are keyed by minimum send amount; use the highest tier we reach.
+                tiers = (corridor.get('feeSchedule') or {}).get('tiers') or []
+                eligible = [t for t in tiers if float(t.get('minValue', 0)) <= amount]
+                fee = float(max(eligible, key=lambda t: float(t['minValue']))['fee']) if eligible else 0.0
+                return quote(provider, rate, fee, amount)
+    except Exception as e:
+        print(f"[{provider}] Error: {e}")
     return None
 
 
 async def fetch_remit_choice(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
-    """Direct POST request scraping for RemitChoice (Bypassing proxy)"""
-    url = "https://www.remitchoice.com/ajaxcalculator.php"
-    
-    country_mappings = {
-        'AT': {'code': 'AUT', 'currency': 'EUR'},
-        'US': {'code': 'USA', 'currency': 'USD'},
-        'GB': {'code': 'GBR', 'currency': 'GBP'},
-        'PK': {'code': 'PAK', 'currency': 'PKR'},
-        'IN': {'code': 'IND', 'currency': 'INR'},
-        'BD': {'code': 'BGD', 'currency': 'BDT'},
-        'PH': {'code': 'PHL', 'currency': 'PHP'},
-        'DE': {'code': 'DEU', 'currency': 'EUR'},
-    }
-    
-    if from_country not in country_mappings or to_country not in country_mappings:
+    """RemitChoice calculator endpoint (HTML fragment)."""
+    if from_country not in COUNTRIES or to_country not in COUNTRIES:
         return None
-        
+    src, dst = COUNTRIES[from_country], COUNTRIES[to_country]
     payload = {
-        'sending_country': country_mappings[from_country]['code'],
-        'receiving_country': country_mappings[to_country]['code'],
-        'sendingcurrencycode': country_mappings[from_country]['currency'],
-        'receivingcurrencycode': country_mappings[to_country]['currency'],
+        'sending_country': src[0],
+        'receiving_country': dst[0],
+        'sendingcurrencycode': src[2],
+        'receivingcurrencycode': dst[2],
         'payout_method': 'Bank',
         'payout_patner': 'Bank',
         'sending_amount': str(amount),
         'receiving_amount': '',
         'total_payable_amount': '',
-        'action': 's_country'
+        'action': 's_country',
     }
-    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Referer': 'https://www.remitchoice.com/',
     }
-    
     provider = "RemitChoice"
     async with httpx.AsyncClient() as client:
         try:
-            response = await request_with_retry(client, provider, "POST", url, data=payload, headers=headers)
+            response = await request_with_retry(client, provider, "POST", "https://www.remitchoice.com/ajaxcalculator.php", data=payload, headers=headers)
             if response is None:
                 return None
             html = response.text
-            
             rate_match = re.search(r'Exchange Rate 1 [A-Z]{3} = (\d+(?:\.\d+)?) [A-Z]{3}', html)
             fee_match = re.search(r'Transfer Fee: (\d+(?:\.\d+)?) [A-Z]{3}', html)
-            
-            if rate_match:
-                exchange_rate = float(rate_match.group(1))
-                transfer_fee = float(fee_match.group(1)) if fee_match else 0.0
-                return {
-                    "provider": "RemitChoice",
-                    "rate": exchange_rate,
-                    "fee": transfer_fee,
-                    "received_amount": round((amount * exchange_rate) - transfer_fee, 2)
-                }
+            if not rate_match:
+                return None
+            text = re.sub(r'<[^>]+>', ' ', html)
+            methods = [label for key, label in (("Account Transfer", "Bank deposit"), ("Wallet", "Mobile wallet"), ("Cash Pickup", "Cash pickup")) if key in text]
+            return quote(provider, float(rate_match.group(1)), float(fee_match.group(1)) if fee_match else 0.0, amount,
+                         payout_methods=methods or None)
         except Exception as e:
             print(f"[{provider}] Error: {e}")
-            
     return None
 
-# Simple in-memory cache to prevent LiteSpeed max children errors
-RATE_CACHE = {}
-CACHE_DURATION_SECONDS = 600  # Cache results for 10 minutes
 
 async def fetch_remitly(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
-    """Scrapes Remitly embedded Next.js JSON without a browser."""
-    from_lower = from_country.lower()
-    to_lower = to_country.lower()
-    
-    # Remitly uses full country names in the URL for the destination, e.g., /gb/en/pakistan
-    country_name_map = {
-        'pk': 'pakistan',
-        'in': 'india',
-        'ph': 'philippines',
-        'bd': 'bangladesh',
-        'cn': 'china',
-        'ng': 'nigeria',
-        'eg': 'egypt',
-        'ma': 'morocco',
-        'ae': 'united-arab-emirates',
-        'lk': 'sri-lanka'
-    }
-    
-    to_name = country_name_map.get(to_lower)
-    if not to_name:
-        print(f"[Remitly] Destination {to_country} not mapped.")
+    """Remitly corridor pages embed 'merchandisingFacts' with everyday and
+    first-transfer (effective) rates plus promo metadata."""
+    if to_country not in COUNTRIES:
         return None
-        
-    url = f"https://www.remitly.com/{from_lower}/en/{to_name}"
-    
+    url = f"https://www.remitly.com/{from_country.lower()}/en/{COUNTRIES[to_country][3]}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
-    
     provider = "Remitly"
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
@@ -370,75 +375,190 @@ async def fetch_remitly(from_country: str, to_country: str, amount: float) -> Op
             if response is None:
                 return None
             html = response.text
-            
-            # Use smart regex to extract from HTML text rendered by server
-            rate_match = re.search(r'1\s+([A-Z]{3})\s*=\s*(\d+(?:[.,]\d+)?)\s*([A-Z]{3})', html)
-            fee_match = re.search(r'"feesAsLowAs":"([\d\.]+)"', html)
-            
-            if not rate_match:
-                print("[Remitly] No rate match found in HTML!")
+            # Remitly redirects unsupported corridors to a generic page; make sure it is the right one.
+            if COUNTRIES[to_country][3] not in str(response.url):
+                print(f"[{provider}] {from_country}->{to_country}: redirected to {response.url}, corridor not offered")
                 return None
-                
-            exchange_rate = float(rate_match.group(2).replace(',', '.'))
-            fee = float(fee_match.group(1)) if fee_match else 0.0
-            
-            return {
-                "provider": "Remitly",
-                "rate": exchange_rate,
-                "fee": fee,
-                "received_amount": round((amount * exchange_rate) - fee, 2)
-            }
-                
+
+            facts_match = re.search(r'"merchandisingFacts":(\{[^{}]*\})', html)
+            if not facts_match:
+                print(f"[{provider}] {from_country}->{to_country}: no merchandisingFacts in page")
+                return None
+            facts = json.loads(facts_match.group(1))
+            everyday = float(facts.get("everydayRateAsLowAs") or 0)
+            if everyday <= 0:
+                return None
+            fee = float(facts.get("everydayFeeAsLowAs") or facts.get("feesAsLowAs") or 0)
+
+            extra: Dict[str, Any] = {}
+            methods = facts.get("disbursementMessaging")
+            if methods:
+                parts = [m.strip() for m in re.split(r',\s*(?:and\s+)?|\s+and\s+', methods) if m.strip()]
+                extra["payout_methods"] = [m.upper() if m.lower() == "upi" else m[0].upper() + m[1:] for m in parts]
+
+            promo_rate = float(facts.get("effectiveRateAsHighAs") or 0)
+            if promo_rate > everyday:
+                cap_match = re.search(r'promo_code=[A-Z0-9-]*?-(\d+)CAP', html)
+                cap = float(cap_match.group(1)) if cap_match else None
+                promo_fee = float(facts.get("effectiveFeeAsLowAs") or 0)
+                promo_part = min(amount, cap) if cap else amount
+                promo_received = (promo_part - promo_fee) * promo_rate + (amount - promo_part) * everyday
+                message = re.search(r'"promoPackageMessage":"([^"]*)"', html)
+                extra.update(
+                    promotional_rate=round(promo_rate, 6),
+                    promo_received_amount=round(promo_received, 2),
+                    promo_max_amount=cap,
+                    promo_description=(message.group(1).split("\\n")[0].strip() if message else "Special rate on your first transfer"),
+                )
+            return quote(provider, everyday, fee, amount, **extra)
         except Exception as e:
-            print(f"[{provider}] Network Error: {e}")
-            
+            print(f"[{provider}] Error: {e}")
     return None
+
+
+async def _profee_calc(client: httpx.AsyncClient, src: tuple, dst: tuple, amount: float) -> Optional[Dict[str, Any]]:
+    response = await request_with_retry(
+        client, "Profee", "POST", "https://terminal.profee.com/api/v2/transfer/terminal/calculation",
+        json={"from": {"currency": src[2], "amount": amount, "country": src[1]},
+              "to": {"currency": dst[2], "amount": None, "country": dst[1]},
+              "skipLimitValidation": True},
+        headers={'Origin': 'https://www.profee.com', 'Referer': 'https://www.profee.com/'},
+    )
+    if response is None:
+        return None
+    data = response.json()
+    if (data.get("status") or {}).get("code") != "OK":
+        return None
+    return data.get("body")
+
+
+async def fetch_profee(from_country: str, to_country: str, amount: float) -> Optional[Dict[str, Any]]:
+    """Profee's public calculator. A rate of type PROMO is a first-transfer rate
+    valid up to maxAmount; quoting just above that cap returns the regular rate."""
+    if from_country not in COUNTRIES or to_country not in COUNTRIES:
+        return None
+    src, dst = COUNTRIES[from_country], COUNTRIES[to_country]
+    provider = "Profee"
+    async with httpx.AsyncClient() as client:
+        try:
+            body = await _profee_calc(client, src, dst, amount)
+            if not body:
+                return None
+            rate_info = body.get("currencyRate") or {}
+            rate = float(rate_info.get("rate") or 0)
+            if rate <= 0:
+                return None
+            fee = float((body.get("feeSum") or {}).get("amount") or 0)
+            fee_is_promo = (body.get("feeSum") or {}).get("type") == "PROMO"
+
+            if rate_info.get("type") != "PROMO":
+                return quote(provider, rate, fee, amount,
+                             fee_note="Introductory fee shown; later transfers may include a fee." if fee_is_promo else None)
+
+            cap = float(((rate_info.get("maxAmount") or {}).get("amount")) or amount)
+            regular_body = await _profee_calc(client, src, dst, max(amount, cap) + 1)
+            regular_rate = float(((regular_body or {}).get("currencyRate") or {}).get("rate") or 0)
+            if regular_rate <= 0 or regular_rate >= rate:
+                return None
+            promo_part = min(amount, cap)
+            promo_received = (promo_part - fee) * rate + (amount - promo_part) * regular_rate
+            return quote(
+                provider, regular_rate, fee, amount,
+                promotional_rate=round(rate, 6),
+                promo_received_amount=round(promo_received, 2),
+                promo_max_amount=cap,
+                promo_description="Promotional exchange rate on your first transfer",
+                fee_note="Introductory fee shown; later transfers may include a fee." if fee_is_promo else None,
+            )
+        except Exception as e:
+            print(f"[{provider}] Error: {e}")
+    return None
+
+
+# ============ RATES ENDPOINT ============
+RATE_CACHE: Dict[str, Any] = {}
+CACHE_DURATION_SECONDS = 600  # 10 minutes
+
 
 @app.get("/api/rates")
 @app.get("/rates")
 async def get_rates(
-    from_country: str = Query(..., description="ISO 2 code representing the sending country (e.g., US, GB)"),
-    to_country: str = Query(..., description="ISO 2 code representing the receiving country (e.g., IN, BD)"),
-    amount: float = Query(100.0, description="Amount to be transferred")
+    from_country: str = Query(..., description="ISO 2 code of the sending country (e.g. GB, DE)"),
+    to_country: str = Query(..., description="ISO 2 code of the receiving country (e.g. IN, PK)"),
+    amount: float = Query(100.0, gt=0, le=1_000_000, description="Amount to send, in the sending currency"),
 ):
     from_country = from_country.upper()
     to_country = to_country.upper()
-    
-    # Check if we have a valid cached result first!
     cache_key = f"{from_country}_{to_country}_{amount}"
-    current_time = time.time()
-    
-    if cache_key in RATE_CACHE:
-        cached_time, cached_results = RATE_CACHE[cache_key]
-        # If the cache is younger than our duration (10 minutes)
-        if current_time - cached_time < CACHE_DURATION_SECONDS:
-            return cached_results
-    
-    # Run fetch operations concurrently so everything finishes faster
-    tasks = [
+    now = time.time()
+
+    cached = RATE_CACHE.get(cache_key)
+    if cached and now - cached[0] < CACHE_DURATION_SECONDS:
+        return cached[1]
+
+    results = await asyncio.gather(
         fetch_taptap_send(from_country, to_country, amount),
         fetch_remit_choice(from_country, to_country, amount),
         fetch_remitly(from_country, to_country, amount),
-    ]
-    
-    results = await asyncio.gather(*tasks)
-    
-    # Filter out None results
-    valid_rates = [res for res in results if res is not None]
+        fetch_profee(from_country, to_country, amount),
+    )
+    valid = [r for r in results if r and r.get("received_amount", 0) > 0]
 
-    # Gracefully degrade to stale cache if every provider fails temporarily.
-    if not valid_rates and cache_key in RATE_CACHE:
-        cached_time, cached_results = RATE_CACHE[cache_key]
-        if current_time - cached_time < 3600 and cached_results:
-            return cached_results
-    
-    # Sort by who gives the recipient the most money (descending)
-    valid_rates.sort(key=lambda x: x['received_amount'], reverse=True)
-    
-    # Save the successful result to our cache
-    RATE_CACHE[cache_key] = (current_time, valid_rates)
-    
-    return valid_rates
+    # Gracefully degrade to a stale cache if every provider fails temporarily.
+    if not valid and cached and now - cached[0] < 3600 and cached[1]:
+        return cached[1]
+
+    valid.sort(key=lambda r: r["received_amount"], reverse=True)
+    RATE_CACHE[cache_key] = (now, valid)
+    return valid
+
+
+# ============ MID-MARKET RATE ============
+MID_MARKET_CACHE: Dict[str, Any] = {}
+MID_MARKET_TTL_SECONDS = 3600
+
+
+@app.get("/api/mid-market")
+async def get_mid_market(
+    base: str = Query(..., min_length=3, max_length=3),
+    quote_currency: str = Query(..., alias="quote", min_length=3, max_length=3),
+):
+    """Reference mid-market rate from ExchangeRate-API's open feed (updated daily),
+    with the fawazahmed0 currency-api as a fallback."""
+    base, quote_currency = base.upper(), quote_currency.upper()
+    cached = MID_MARKET_CACHE.get(base)
+    if not cached or time.time() - cached["fetched"] > MID_MARKET_TTL_SECONDS:
+        entry = None
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await client.get(f"https://open.er-api.com/v6/latest/{base}", timeout=HTTP_TIMEOUT_SECONDS)
+                d = r.json()
+                if d.get("result") == "success":
+                    entry = {"rates": d["rates"], "updated": d.get("time_last_update_unix"), "source": "ExchangeRate-API",
+                             "source_url": "https://www.exchangerate-api.com"}
+            except Exception as e:
+                print(f"[mid-market] primary failed: {e}")
+            if entry is None:
+                try:
+                    r = await client.get(f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/{base.lower()}.json", timeout=HTTP_TIMEOUT_SECONDS)
+                    d = r.json()
+                    entry = {"rates": {k.upper(): v for k, v in d[base.lower()].items()},
+                             "updated": int(datetime.strptime(d["date"], "%Y-%m-%d").timestamp()),
+                             "source": "currency-api", "source_url": "https://github.com/fawazahmed0/exchange-api"}
+                except Exception as e:
+                    print(f"[mid-market] fallback failed: {e}")
+        if entry is None:
+            if not cached:
+                raise HTTPException(status_code=503, detail="Mid-market rate unavailable")
+        else:
+            entry["fetched"] = time.time()
+            MID_MARKET_CACHE[base] = cached = entry
+
+    rate = cached["rates"].get(quote_currency)
+    if not rate:
+        raise HTTPException(status_code=404, detail="Currency not supported")
+    return {"base": base, "quote": quote_currency, "rate": rate, "updated": cached["updated"],
+            "source": cached["source"], "source_url": cached["source_url"]}
 
 
 # ============ RATE ALERTS ENDPOINTS ============
